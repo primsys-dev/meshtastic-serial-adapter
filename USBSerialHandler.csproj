@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Standalone .NET 10 clone of MqttServer/USBSerialHandler.cpp. It is not
+       part of the C++ Makefile build; reference this project (or just copy
+       USBSerialHandler.cs) from an external .NET 10 handler. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Meshtastic.UsbSerial</AssemblyName>
+    <RootNamespace>Meshtastic.UsbSerial</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!-- Optional build-time platform override:
+         dotnet build -p:UsbSerialPlatform=Windows
+         dotnet build -p:UsbSerialPlatform=Linux
+         dotnet build -p:UsbSerialPlatform=MacOS
+         Auto (the default) uses OperatingSystem at runtime. The resulting
+         symbols only choose port-name detection/scoring defaults; the same
+         binary still runs on the other OS when built with Auto. -->
+    <UsbSerialPlatform Condition="'$(UsbSerialPlatform)' == ''">Auto</UsbSerialPlatform>
+    <DefineConstants Condition="'$(UsbSerialPlatform)' == 'Windows'">$(DefineConstants);USB_SERIAL_WINDOWS</DefineConstants>
+    <DefineConstants Condition="'$(UsbSerialPlatform)' == 'Linux'">$(DefineConstants);USB_SERIAL_LINUX</DefineConstants>
+    <DefineConstants Condition="'$(UsbSerialPlatform)' == 'MacOS'">$(DefineConstants);USB_SERIAL_MACOS</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System.IO.Ports is not part of the shared framework. -->
+    <PackageReference Include="System.IO.Ports" Version="10.0.12" />
+  </ItemGroup>
+
+</Project>
