@@ -20,6 +20,7 @@
 //   https://www.primsys.eu/
 
 using System.Buffers.Binary;
+using System.Globalization;
 using System.IO.Ports;
 using System.Text;
 
@@ -53,8 +54,10 @@ namespace Meshtastic.UsbSerial;
 /// <para>
 /// The handler opens a Meshtastic Stream API serial port, requests the device
 /// configuration, reassembles the <c>0x94 0xC3</c> framed protobuf messages and
-/// invokes a text or binary callback for decoded packets. A non-empty callback
-/// result is sent back to the packet sender.
+/// invokes a text or binary callback for decoded packets, plus a
+/// notification-only callback for decoded <c>POSITION_APP</c> packets. A
+/// non-empty text/binary callback result is sent back to the packet sender;
+/// position packets never generate a reply.
 /// </para>
 /// <para>
 /// The COM port may be a USB CDC/ACM port, a USB-UART bridge, or a Bluetooth
@@ -84,6 +87,9 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
     /// <summary><c>PortNum.PRIVATE_APP</c>.</summary>
     public const uint BinaryPortNum = UsbSerialProtocol.BinaryPortNum;
 
+    /// <summary><c>PortNum.POSITION_APP</c>.</summary>
+    public const uint PositionPortNum = UsbSerialProtocol.PositionPortNum;
+
     /// <summary>The reserved broadcast node number.</summary>
     public const uint BroadcastNode = UsbSerialProtocol.BroadcastNode;
 
@@ -100,6 +106,7 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
     private readonly object _sendLock = new();
     private readonly object _textHandlerLock = new();
     private readonly object _binaryHandlerLock = new();
+    private readonly object _positionHandlerLock = new();
 
     private SerialPort? _port;
     private Thread? _reader;
@@ -110,6 +117,7 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
 
     private Func<string, string?>? _textHandler;
     private Func<byte[], byte[]?>? _binaryHandler;
+    private Action<MeshtasticPosition>? _positionHandler;
 
     /// <summary>Creates the handler and immediately calls <see cref="Start"/>.</summary>
     /// <param name="settings">Device, mode and protocol settings.</param>
@@ -122,12 +130,18 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
     /// Called on the reader thread with a private copy of the bytes for
     /// <c>PRIVATE_APP</c> packets. Return null or an empty array for no reply.
     /// </param>
+    /// <param name="positionHandler">
+    /// Notification callback for decoded <c>POSITION_APP</c> packets. The
+    /// callback returns no data; the position is also logged when
+    /// <see cref="UsbSerialSettings.LogPositions"/> is enabled.
+    /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="settings"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">A numeric setting is invalid.</exception>
     public UsbSerialHandler(
         UsbSerialSettings settings,
         Func<string, string?>? textHandler = null,
-        Func<byte[], byte[]?>? binaryHandler = null)
+        Func<byte[], byte[]?>? binaryHandler = null,
+        Action<MeshtasticPosition>? positionHandler = null)
     {
         ArgumentNullException.ThrowIfNull(settings);
         ValidateSettings(settings);
@@ -135,6 +149,7 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
         _settings = settings;
         _textHandler = textHandler;
         _binaryHandler = binaryHandler;
+        _positionHandler = positionHandler;
         Start();
     }
 
@@ -171,6 +186,15 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
         lock (_binaryHandlerLock)
         {
             _binaryHandler = handler;
+        }
+    }
+
+    /// <summary>Replaces the position notification callback.</summary>
+    public void SetPositionHandler(Action<MeshtasticPosition>? handler)
+    {
+        lock (_positionHandlerLock)
+        {
+            _positionHandler = handler;
         }
     }
 
@@ -784,6 +808,12 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
             return;
         }
 
+        if (packet.PortNum == PositionPortNum)
+        {
+            HandlePosition(packet);
+            return;
+        }
+
         var expected = _settings.Mode == UsbSerialMode.Text
             ? TextPortNum
             : BinaryPortNum;
@@ -870,6 +900,43 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
             Log(UsbSerialLogLevel.Warning,
                 "binary handler failed: " + error.Message);
             return null;
+        }
+    }
+
+    private void HandlePosition(DecodedPacket packet)
+    {
+        if (!TryDecodePosition(packet.Payload, packet.From, out var position))
+        {
+            Log(UsbSerialLogLevel.Debug, "could not decode a POSITION_APP payload");
+            return;
+        }
+
+        if (_settings.LogPositions)
+        {
+            Log(UsbSerialLogLevel.Info, "position " + position);
+        }
+        CallPositionHandler(position);
+    }
+
+    private void CallPositionHandler(MeshtasticPosition position)
+    {
+        Action<MeshtasticPosition>? handler;
+        lock (_positionHandlerLock)
+        {
+            handler = _positionHandler;
+        }
+        if (handler is null)
+        {
+            return;
+        }
+        try
+        {
+            handler(position);
+        }
+        catch (Exception error)
+        {
+            Log(UsbSerialLogLevel.Warning,
+                "position handler failed: " + error.Message);
         }
     }
 
@@ -1228,6 +1295,298 @@ public sealed class UsbSerialHandler : IDisposable, IAsyncDisposable
         return hasPortnum;
     }
 
+    private static bool TryDecodePosition(ReadOnlySpan<byte> data, uint from,
+                                          out MeshtasticPosition position)
+    {
+        double? latitude = null;
+        double? longitude = null;
+        int? altitudeMeters = null;
+        int? altitudeHaeMeters = null;
+        uint? timeSeconds = null;
+        uint? timestampSeconds = null;
+        int? timestampMillisAdjust = null;
+        uint? locationSource = null;
+        uint? altitudeSource = null;
+        uint? pdop = null;
+        uint? hdop = null;
+        uint? vdop = null;
+        uint? gpsAccuracy = null;
+        uint? groundSpeed = null;
+        uint? groundTrack = null;
+        uint? fixQuality = null;
+        uint? fixType = null;
+        uint? satsInView = null;
+        uint? precisionBits = null;
+        var pos = 0;
+        position = null!;
+
+        while (pos < data.Length)
+        {
+            if (!TryReadVarint(data, ref pos, out var key))
+            {
+                return false;
+            }
+            var field = (uint)(key >> 3);
+            var wire = (uint)(key & 0x07);
+            switch (field)
+            {
+                case 1 when wire == 5:
+                {
+                    if (!TryReadFixed32(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    latitude = unchecked((int)value) / 10_000_000.0;
+                    break;
+                }
+                case 2 when wire == 5:
+                {
+                    if (!TryReadFixed32(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    longitude = unchecked((int)value) / 10_000_000.0;
+                    break;
+                }
+                case 3 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    altitudeMeters = unchecked((int)value);
+                    break;
+                }
+                case 4 when wire == 5:
+                {
+                    if (!TryReadFixed32(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    timeSeconds = value;
+                    break;
+                }
+                case 5 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    locationSource = value;
+                    break;
+                }
+                case 6 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    altitudeSource = value;
+                    break;
+                }
+                case 7 when wire == 5:
+                {
+                    if (!TryReadFixed32(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    timestampSeconds = value;
+                    break;
+                }
+                case 8 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    timestampMillisAdjust = unchecked((int)value);
+                    break;
+                }
+                case 9 when wire == 0:
+                {
+                    if (!TryReadZigZag32(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    altitudeHaeMeters = value;
+                    break;
+                }
+                case 11 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    pdop = value;
+                    break;
+                }
+                case 12 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    hdop = value;
+                    break;
+                }
+                case 13 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    vdop = value;
+                    break;
+                }
+                case 14 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    gpsAccuracy = value;
+                    break;
+                }
+                case 15 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    groundSpeed = value;
+                    break;
+                }
+                case 16 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    groundTrack = value;
+                    break;
+                }
+                case 17 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    fixQuality = value;
+                    break;
+                }
+                case 18 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    fixType = value;
+                    break;
+                }
+                case 19 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    satsInView = value;
+                    break;
+                }
+                case 23 when wire == 0:
+                {
+                    if (!TryReadVarintUInt(data, ref pos, out var value))
+                    {
+                        return false;
+                    }
+                    precisionBits = value;
+                    break;
+                }
+                default:
+                    if (!TrySkipField(data, ref pos, wire))
+                    {
+                        return false;
+                    }
+                    break;
+            }
+        }
+
+        DateTimeOffset? time = null;
+        if (timeSeconds is { } seconds && seconds != 0)
+        {
+            time = DateTimeOffset.FromUnixTimeSeconds(seconds);
+        }
+
+        DateTimeOffset? timestamp = null;
+        if (timestampSeconds is { } timestampValue && timestampValue != 0)
+        {
+            timestamp = DateTimeOffset.FromUnixTimeSeconds(timestampValue);
+            if (timestampMillisAdjust is { } millis)
+            {
+                timestamp = timestamp.Value.AddMilliseconds(millis);
+            }
+        }
+
+        position = new MeshtasticPosition
+        {
+            FromNode = from,
+            Latitude = latitude,
+            Longitude = longitude,
+            AltitudeMeters = altitudeMeters,
+            AltitudeHaeMeters = altitudeHaeMeters,
+            Time = time,
+            Timestamp = timestamp,
+            TimestampMillisAdjust = timestampMillisAdjust,
+            LocationSource = locationSource is { } location
+                ? (MeshtasticLocationSource)location
+                : null,
+            AltitudeSource = altitudeSource is { } altitude
+                ? (MeshtasticAltitudeSource)altitude
+                : null,
+            Pdop = pdop is { } p ? p / 100.0 : null,
+            Hdop = hdop is { } h ? h / 100.0 : null,
+            Vdop = vdop is { } v ? v / 100.0 : null,
+            GpsAccuracyMeters = gpsAccuracy is { } accuracy
+                ? accuracy / 1000.0
+                : null,
+            GroundSpeedKph = groundSpeed,
+            GroundTrackDegrees = groundTrack is { } track
+                ? track / 100.0
+                : null,
+            FixQuality = fixQuality,
+            FixType = fixType,
+            SatellitesInView = satsInView,
+            PrecisionBits = precisionBits,
+        };
+        return true;
+    }
+
+    private static bool TryReadVarintUInt(ReadOnlySpan<byte> data, ref int pos,
+                                          out uint value)
+    {
+        if (!TryReadVarint(data, ref pos, out var raw))
+        {
+            value = 0;
+            return false;
+        }
+        value = (uint)raw;
+        return true;
+    }
+
+    private static bool TryReadZigZag32(ReadOnlySpan<byte> data, ref int pos,
+                                        out int value)
+    {
+        if (!TryReadVarintUInt(data, ref pos, out var raw))
+        {
+            value = 0;
+            return false;
+        }
+        value = DecodeZigZag32(raw);
+        return true;
+    }
+
+    private static int DecodeZigZag32(uint value) =>
+        unchecked((int)((value >> 1) ^ (uint)-(int)(value & 1)));
+
     private static bool TryDecodeMeshPacket(ReadOnlySpan<byte> data,
                                             out DecodedPacket packet)
     {
@@ -1474,11 +1833,196 @@ public static class UsbSerialProtocol
     /// <summary><c>PortNum.PRIVATE_APP</c>.</summary>
     public const uint BinaryPortNum = 256;
 
+    /// <summary><c>PortNum.POSITION_APP</c>.</summary>
+    public const uint PositionPortNum = 3;
+
     /// <summary>The reserved broadcast node number (all ones).</summary>
     public const uint BroadcastNode = 0xFFFFFFFFu;
 
     /// <summary>Largest Meshtastic Stream API protobuf payload.</summary>
     public const int MaxFramePayload = 512;
+}
+
+/// <summary>Source of a Position fix.</summary>
+public enum MeshtasticLocationSource
+{
+    Unset = 0,
+    Manual = 1,
+    Internal = 2,
+    External = 3,
+}
+
+/// <summary>Source of a Position altitude.</summary>
+public enum MeshtasticAltitudeSource
+{
+    Unset = 0,
+    Manual = 1,
+    Internal = 2,
+    External = 3,
+    Barometric = 4,
+}
+
+/// <summary>
+/// Decoded Meshtastic <c>POSITION_APP</c> payload. Optional fields are null
+/// when the sender did not include them. Coordinates use WGS-84 degrees.
+/// </summary>
+public sealed class MeshtasticPosition
+{
+    /// <summary>Node number of the sender.</summary>
+    public uint FromNode { get; init; }
+
+    /// <summary>Latitude in degrees (position latitude_i / 1e7).</summary>
+    public double? Latitude { get; init; }
+
+    /// <summary>Longitude in degrees (position longitude_i / 1e7).</summary>
+    public double? Longitude { get; init; }
+
+    /// <summary>Altitude above mean sea level, in meters.</summary>
+    public int? AltitudeMeters { get; init; }
+
+    /// <summary>Height above ellipsoid, in meters.</summary>
+    public int? AltitudeHaeMeters { get; init; }
+
+    /// <summary>Position timestamp supplied by the radio, if present.</summary>
+    public DateTimeOffset? Time { get; init; }
+
+    /// <summary>GPS solution timestamp, including the millisecond adjustment.</summary>
+    public DateTimeOffset? Timestamp { get; init; }
+
+    /// <summary>Millisecond adjustment applied to <see cref="Timestamp"/>.</summary>
+    public int? TimestampMillisAdjust { get; init; }
+
+    /// <summary>How the position was obtained.</summary>
+    public MeshtasticLocationSource? LocationSource { get; init; }
+
+    /// <summary>How the altitude was obtained.</summary>
+    public MeshtasticAltitudeSource? AltitudeSource { get; init; }
+
+    /// <summary>Position dilution of precision, in units.</summary>
+    public double? Pdop { get; init; }
+
+    /// <summary>Horizontal dilution of precision, in units.</summary>
+    public double? Hdop { get; init; }
+
+    /// <summary>Vertical dilution of precision, in units.</summary>
+    public double? Vdop { get; init; }
+
+    /// <summary>GPS accuracy converted from millimeters to meters.</summary>
+    public double? GpsAccuracyMeters { get; init; }
+
+    /// <summary>Ground speed in km/h, if present.</summary>
+    public uint? GroundSpeedKph { get; init; }
+
+    /// <summary>True-north ground track in degrees, if present.</summary>
+    public double? GroundTrackDegrees { get; init; }
+
+    /// <summary>NMEA fix quality value.</summary>
+    public uint? FixQuality { get; init; }
+
+    /// <summary>NMEA fix type (2D/3D).</summary>
+    public uint? FixType { get; init; }
+
+    /// <summary>Satellites in view.</summary>
+    public uint? SatellitesInView { get; init; }
+
+    /// <summary>Position precision bits advertised by the sender.</summary>
+    public uint? PrecisionBits { get; init; }
+
+    /// <summary>One-line diagnostic representation used by the position log.</summary>
+    public override string ToString()
+    {
+        var parts = new List<string>
+        {
+            "node=0x" + FromNode.ToString("X8", CultureInfo.InvariantCulture),
+        };
+
+        if (Latitude.HasValue)
+        {
+            parts.Add("lat=" + Latitude.Value.ToString(
+                "F7", CultureInfo.InvariantCulture));
+        }
+        if (Longitude.HasValue)
+        {
+            parts.Add("lon=" + Longitude.Value.ToString(
+                "F7", CultureInfo.InvariantCulture));
+        }
+        if (!Latitude.HasValue && !Longitude.HasValue)
+        {
+            parts.Add("lat/lon=unknown");
+        }
+        if (AltitudeMeters.HasValue)
+        {
+            parts.Add("alt=" + AltitudeMeters.Value.ToString(
+                CultureInfo.InvariantCulture) + "m");
+        }
+        if (AltitudeHaeMeters.HasValue)
+        {
+            parts.Add("hae=" + AltitudeHaeMeters.Value.ToString(
+                CultureInfo.InvariantCulture) + "m");
+        }
+        if (Time.HasValue)
+        {
+            parts.Add("time=" + Time.Value.ToString(
+                "O", CultureInfo.InvariantCulture));
+        }
+        if (Timestamp.HasValue)
+        {
+            parts.Add("timestamp=" + Timestamp.Value.ToString(
+                "O", CultureInfo.InvariantCulture));
+        }
+        if (GroundSpeedKph.HasValue)
+        {
+            parts.Add("speed=" + GroundSpeedKph.Value.ToString(
+                CultureInfo.InvariantCulture) + "km/h");
+        }
+        if (GroundTrackDegrees.HasValue)
+        {
+            parts.Add("track=" + GroundTrackDegrees.Value.ToString(
+                "F2", CultureInfo.InvariantCulture) + "deg");
+        }
+        if (Pdop.HasValue || Hdop.HasValue || Vdop.HasValue)
+        {
+            parts.Add("dop=" +
+                      (Pdop.HasValue ? Pdop.Value.ToString(
+                          "F2", CultureInfo.InvariantCulture) : "?") + "/" +
+                      (Hdop.HasValue ? Hdop.Value.ToString(
+                          "F2", CultureInfo.InvariantCulture) : "?") + "/" +
+                      (Vdop.HasValue ? Vdop.Value.ToString(
+                          "F2", CultureInfo.InvariantCulture) : "?"));
+        }
+        if (GpsAccuracyMeters.HasValue)
+        {
+            parts.Add("accuracy=" + GpsAccuracyMeters.Value.ToString(
+                "F1", CultureInfo.InvariantCulture) + "m");
+        }
+        if (SatellitesInView.HasValue)
+        {
+            parts.Add("sats=" + SatellitesInView.Value.ToString(
+                CultureInfo.InvariantCulture));
+        }
+        if (FixQuality.HasValue || FixType.HasValue)
+        {
+            parts.Add("fix=" +
+                      (FixQuality.HasValue ? FixQuality.Value.ToString(
+                          CultureInfo.InvariantCulture) : "?") + "/" +
+                      (FixType.HasValue ? FixType.Value.ToString(
+                          CultureInfo.InvariantCulture) : "?"));
+        }
+        if (LocationSource.HasValue)
+        {
+            parts.Add("src=" + LocationSource.Value);
+        }
+        if (AltitudeSource.HasValue)
+        {
+            parts.Add("altSrc=" + AltitudeSource.Value);
+        }
+        if (PrecisionBits.HasValue)
+        {
+            parts.Add("precision=" + PrecisionBits.Value.ToString(
+                CultureInfo.InvariantCulture));
+        }
+        return string.Join(" ", parts);
+    }
 }
 
 /// <summary>One serial port reported by <see cref="UsbSerialHandler.EnumeratePorts"/>.</summary>
@@ -1542,6 +2086,12 @@ public sealed class UsbSerialSettings
     /// This also tells the radio that a structured API client is present.
     /// </summary>
     public bool RequestConfigOnStart { get; set; } = true;
+
+    /// <summary>
+    /// Log every decoded <c>POSITION_APP</c> packet at information level
+    /// through <see cref="Log"/> in addition to invoking the position handler.
+    /// </summary>
+    public bool LogPositions { get; set; } = true;
 
     /// <summary>Payload sent by <see cref="UsbSerialHandler.SendTest"/> in text mode.</summary>
     public string TestText { get; set; } = "USBSerialHandler test";
