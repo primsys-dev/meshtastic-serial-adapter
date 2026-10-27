@@ -16,8 +16,8 @@ This module is our tribute to the Meshtastic community and vibe.
 
 This module is the serial transport core used by the **Primsys** extension.
 Primsys-specific integration and configuration are maintained separately.
-If you like this project you and want to invest in its future development, 
-please see our sponsorship option and the Repo button. Thank you!
+If you like this project and you want to invest in its future development, 
+please see our sponsorship (tip) option and the Repo button. Thank you!
 
 - Primsys: <https://www.primsys.eu/>
 - Project sponsorship: <https://www.paypal.me/primsys>
