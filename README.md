@@ -21,6 +21,7 @@ please see our sponsorship (tip) option and the Repo button. Thank you!
 
 - Primsys: <https://www.primsys.eu/>
 - Project sponsorship: <https://www.paypal.me/primsys>
+- Bitcoin: bc1qjh3d3gcl7cru5ucpuw4khv3t4q2cpl7pat4hxg
 
 ## Requirements
 
